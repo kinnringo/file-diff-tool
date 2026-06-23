@@ -13,9 +13,11 @@ class DiffReport:
         self.old_dir = Path(old_dir)
         self.new_dir = Path(new_dir)
         self.extensions = extensions
+        self.include_all = extensions == ['all']
         self.added_files = []
         self.deleted_files = []
         self.modified_files = []
+        self.binary_modified_files = []
         self.old_all_files = []
         self.new_all_files = []
         self.old_file_paths = {}
@@ -24,52 +26,90 @@ class DiffReport:
     def scan_directories(self):
         old_files = self._get_files(self.old_dir)
         new_files = self._get_files(self.new_dir)
-        
+
         self.old_all_files = sorted(old_files.keys())
         self.new_all_files = sorted(new_files.keys())
         self.old_file_paths = old_files
         self.new_file_paths = new_files
-        
+
         old_set = set(old_files.keys())
         new_set = set(new_files.keys())
-        
+
         self.added_files = sorted(new_set - old_set)
         self.deleted_files = sorted(old_set - new_set)
         common_files = sorted(old_set & new_set)
-        
+
         for rel_path in common_files:
-            old_content = self._read_file(old_files[rel_path])
-            new_content = self._read_file(new_files[rel_path])
-            
+            old_path = old_files[rel_path]
+            new_path = new_files[rel_path]
+
+            if self._is_binary(old_path) or self._is_binary(new_path):
+                try:
+                    old_bytes = old_path.read_bytes()
+                    new_bytes = new_path.read_bytes()
+                except Exception:
+                    old_bytes, new_bytes = None, None
+                if old_bytes != new_bytes:
+                    self.binary_modified_files.append(rel_path)
+                continue
+
+            old_content = self._read_file(old_path)
+            new_content = self._read_file(new_path)
+
             if old_content != new_content:
                 diff = self._generate_diff(old_content, new_content, rel_path)
                 self.modified_files.append((rel_path, diff))
 
     def _get_files(self, directory: Path) -> Dict[str, Path]:
         files = {}
-        for ext in self.extensions:
-            for file_path in directory.rglob(f"*{ext}"):
-                if file_path.is_file():
+        for root, dirs, filenames in os.walk(directory):
+            for filename in filenames:
+                file_path = Path(root) / filename
+                if self.include_all:
                     rel_path = file_path.relative_to(directory)
                     files[str(rel_path)] = file_path
+                else:
+                    for ext in self.extensions:
+                        if filename.endswith(ext):
+                            rel_path = file_path.relative_to(directory)
+                            files[str(rel_path)] = file_path
+                            break
         return files
+
+    def _is_binary(self, file_path: Path) -> bool:
+        try:
+            with open(file_path, 'rb') as f:
+                chunk = f.read(8192)
+            if b'\x00' in chunk:
+                return True
+            if not chunk:
+                return False
+            text_chars = bytes(range(32, 127)) + b'\n\r\t\b'
+            nontext = sum(1 for b in chunk if b not in text_chars)
+            return (nontext / len(chunk)) > 0.3
+        except Exception:
+            return True
 
     def _read_file(self, file_path: Path) -> List[str]:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 return f.readlines()
         except UnicodeDecodeError:
-            with open(file_path, 'r', encoding='shift_jis') as f:
-                return f.readlines()
+            try:
+                with open(file_path, 'r', encoding='shift_jis') as f:
+                    return f.readlines()
+            except UnicodeDecodeError:
+                with open(file_path, 'r', encoding='latin1') as f:
+                    return f.readlines()
 
     def _generate_diff(self, old_lines: List[str], new_lines: List[str], filename: str) -> List[Tuple[str, int, str]]:
         differ = difflib.Differ()
         diff = list(differ.compare(old_lines, new_lines))
-        
+
         result = []
         old_line_num = 0
         new_line_num = 0
-        
+
         i = 0
         while i < len(diff):
             line = diff[i]
@@ -85,7 +125,7 @@ class DiffReport:
             elif line.startswith('? '):
                 pass
             i += 1
-        
+
         return result
 
     def generate_html(self, output_path: str):
@@ -95,7 +135,7 @@ class DiffReport:
 
     def _build_html(self) -> str:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
+
         html = f'''<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -332,15 +372,15 @@ class DiffReport:
         <script>
         const searchInput = document.getElementById('searchInput');
         const searchStats = document.getElementById('searchStats');
-        
+
         searchInput.addEventListener('input', function() {{
             const query = this.value.trim();
-            
+
             // Remove previous highlights
             document.querySelectorAll('.highlight-match').forEach(el => {{
                 el.classList.remove('highlight-match');
             }});
-            
+
             if (query === '') {{
                 // Show all files
                 document.querySelectorAll('details').forEach(detail => {{
@@ -349,20 +389,20 @@ class DiffReport:
                 searchStats.textContent = '';
                 return;
             }}
-            
+
             let matchedFiles = 0;
             let totalFiles = 0;
-            
+
             // Search in all details elements (files)
             document.querySelectorAll('.section details').forEach(detail => {{
                 totalFiles++;
                 const content = detail.textContent.toLowerCase();
                 const queryLower = query.toLowerCase();
-                
+
                 if (content.includes(queryLower)) {{
                     detail.classList.remove('file-hidden');
                     matchedFiles++;
-                    
+
                     // Highlight matching lines
                     const diffLines = detail.querySelectorAll('.diff-line');
                     diffLines.forEach(line => {{
@@ -375,7 +415,7 @@ class DiffReport:
                     detail.classList.add('file-hidden');
                 }}
             }});
-            
+
             searchStats.textContent = `${{matchedFiles}} / ${{totalFiles}} ファイルがマッチ`;
         }});
         </script>
@@ -395,103 +435,116 @@ class DiffReport:
 
     def _build_directory_section(self) -> str:
         modified_set = {file for file, _ in self.modified_files}
+        binary_modified_set = set(self.binary_modified_files)
         added_set = set(self.added_files)
         deleted_set = set(self.deleted_files)
-        
+
         section = '<div class="section"><h2 class="section-title">ディレクトリ一覧</h2>'
         section += '<details><summary>ファイル一覧を表示</summary>'
         section += '<div class="dir-grid">'
-        
+
         section += '<div class="dir-column">'
         section += f'<div class="dir-title">Old: {self.old_dir}</div>'
         for file in self.old_all_files:
             if file in deleted_set:
                 css_class = 'file-entry file-deleted'
-            elif file in modified_set:
+            elif file in modified_set or file in binary_modified_set:
                 css_class = 'file-entry file-modified'
             else:
                 css_class = 'file-entry'
             section += f'<div class="{css_class}">{file}</div>'
         section += '</div>'
-        
+
         section += '<div class="dir-column">'
         section += f'<div class="dir-title">New: {self.new_dir}</div>'
         for file in self.new_all_files:
             if file in added_set:
                 css_class = 'file-entry file-added'
-            elif file in modified_set:
+            elif file in modified_set or file in binary_modified_set:
                 css_class = 'file-entry file-modified'
             else:
                 css_class = 'file-entry'
             section += f'<div class="{css_class}">{file}</div>'
         section += '</div>'
-        
+
         section += '</div></details></div>'
         return section
 
     def _build_added_section(self) -> str:
         section = '<div class="section"><h2 class="section-title">新規追加ファイル'
         section += f'<span class="badge badge-add">{len(self.added_files)}</span></h2>'
-        
+
         if self.added_files:
             for file in self.added_files:
                 section += '<details><summary>' + file + '</summary>'
-                section += '<div class="diff-content">'
-                
                 file_path = self.new_file_paths[file]
-                content = self._read_file(file_path)
-                
-                for line_num, line in enumerate(content, 1):
-                    section += f'<div class="diff-line diff-add"><span class="line-num">{line_num}</span>+ {self._escape_html(line)}</div>'
-                
-                section += '</div></details>'
+
+                if self._is_binary(file_path):
+                    section += '<div class="diff-content"><div class="no-changes">バイナリファイル（内容は表示しません）</div></div>'
+                else:
+                    section += '<div class="diff-content">'
+                    content = self._read_file(file_path)
+                    for line_num, line in enumerate(content, 1):
+                        section += f'<div class="diff-line diff-add"><span class="line-num">{line_num}</span>+ {self._escape_html(line)}</div>'
+                    section += '</div>'
+
+                section += '</details>'
         else:
             section += '<div class="no-changes">新規ファイルはありません</div>'
-        
+
         section += '</div>'
         return section
 
     def _build_deleted_section(self) -> str:
         section = '<div class="section"><h2 class="section-title">削除ファイル'
         section += f'<span class="badge badge-del">{len(self.deleted_files)}</span></h2>'
-        
+
         if self.deleted_files:
             for file in self.deleted_files:
                 section += '<details><summary>' + file + '</summary>'
-                section += '<div class="diff-content">'
-                
                 file_path = self.old_file_paths[file]
-                content = self._read_file(file_path)
-                
-                for line_num, line in enumerate(content, 1):
-                    section += f'<div class="diff-line diff-del"><span class="line-num">{line_num}</span>- {self._escape_html(line)}</div>'
-                
-                section += '</div></details>'
+
+                if self._is_binary(file_path):
+                    section += '<div class="diff-content"><div class="no-changes">バイナリファイル（内容は表示しません）</div></div>'
+                else:
+                    section += '<div class="diff-content">'
+                    content = self._read_file(file_path)
+                    for line_num, line in enumerate(content, 1):
+                        section += f'<div class="diff-line diff-del"><span class="line-num">{line_num}</span>- {self._escape_html(line)}</div>'
+                    section += '</div>'
+
+                section += '</details>'
         else:
             section += '<div class="no-changes">削除ファイルはありません</div>'
-        
+
         section += '</div>'
         return section
 
     def _build_modified_section(self) -> str:
+        total_modified = len(self.modified_files) + len(self.binary_modified_files)
         section = '<div class="section"><h2 class="section-title">変更ファイル'
-        section += f'<span class="badge badge-mod">{len(self.modified_files)}</span></h2>'
-        
-        if self.modified_files:
+        section += f'<span class="badge badge-mod">{total_modified}</span></h2>'
+
+        if self.modified_files or self.binary_modified_files:
             for file, diff in self.modified_files:
                 section += '<details><summary>' + file + '</summary>'
                 section += '<div class="diff-content">'
-                
+
                 for change_type, line_num, line in diff:
                     if change_type == 'add':
                         section += f'<div class="diff-line diff-add"><span class="line-num">{line_num}</span>+ {self._escape_html(line)}</div>'
                     elif change_type == 'del':
                         section += f'<div class="diff-line diff-del"><span class="line-num">{line_num}</span>- {self._escape_html(line)}</div>'
-                
+
                 section += '</div></details>'
+
+            for file in self.binary_modified_files:
+                section += '<details><summary>' + file + ' (バイナリ)</summary>'
+                section += '<div class="diff-content"><div class="no-changes">バイナリファイルが変更されています（内容比較は省略）</div></div>'
+                section += '</details>'
         else:
             section += '<div class="no-changes">変更ファイルはありません</div>'
-        
+
         section += '</div>'
         return section
 
@@ -504,29 +557,30 @@ def main():
     parser.add_argument('old_dir', help='比較元ディレクトリ')
     parser.add_argument('new_dir', help='比較先ディレクトリ')
     parser.add_argument('-o', '--output', default='diff_report.html', help='出力HTMLファイル名（デフォルト: diff_report.html）')
-    parser.add_argument('-e', '--extensions', nargs='+', default=['.php'], help='対象ファイル拡張子（デフォルト: .php）')
-    
+    parser.add_argument('-e', '--extensions', nargs='+', default=['.php'],
+                         help='対象ファイル拡張子（デフォルト: .php）。"all" を指定すると全ファイル（拡張子なし・隠しファイル・バイナリ含む）が対象になります')
+
     args = parser.parse_args()
-    
+
     if not os.path.exists(args.old_dir):
         print(f"エラー: ディレクトリ '{args.old_dir}' が存在しません", file=sys.stderr)
         sys.exit(1)
-    
+
     if not os.path.exists(args.new_dir):
         print(f"エラー: ディレクトリ '{args.new_dir}' が存在しません", file=sys.stderr)
         sys.exit(1)
-    
+
     print(f"ディレクトリをスキャン中...")
     report = DiffReport(args.old_dir, args.new_dir, args.extensions)
     report.scan_directories()
-    
+
     print(f"差分を生成中...")
     report.generate_html(args.output)
-    
+
     print(f"\n完了:")
     print(f"  新規ファイル: {len(report.added_files)}")
     print(f"  削除ファイル: {len(report.deleted_files)}")
-    print(f"  変更ファイル: {len(report.modified_files)}")
+    print(f"  変更ファイル: {len(report.modified_files) + len(report.binary_modified_files)}")
     print(f"\nレポート: {args.output}")
 
 
